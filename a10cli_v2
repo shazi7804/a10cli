@@ -1,0 +1,279 @@
+#!/bin/bash
+
+# If there exist a10cli.conf variable override files use it...
+[ -f a10cli.ini ] && . a10cli.ini
+[ -f scripts/a10cli.ini ] && . scripts/a10cli.ini
+[ -f /opt/.a10cli.ini ] && . /opt/.a10cli.ini
+[ -f /.a10cli.ini ] && . /.a10cli.ini
+
+MAP_INTERFACES=(ens3 eth0)
+USERNAME=changeme
+PASSWORD=changeme
+FORMAT=json
+VERSION=V2.1
+CURL_TIMEOUT=3
+CURR_RETRY=120
+CURR_TIMEOUT=1
+
+# Environment setting
+PROD_LB=172.30.1.251
+PROD_IPCLASS=172.30
+
+STG_LB=172.16.1.251
+STG_IPCLASS=172.16
+
+DEV_LB=10.0.1.251
+DEV_IPCLASS=10.0
+
+# -----------------------------------
+
+showVersion(){
+  echo "A10 command line v2.0 version."
+  echo "Mapping A10 API v2 only support real server control."
+}
+
+helpMsg(){
+  echo ""
+  echo -e "Usage: $0 [option]"
+  echo ""
+  echo -e "[option]"
+  echo -e "  stop,start,restart           select one active."
+  echo -e "  overconn                     confirm the connection until 0"
+  echo ""
+  exit 1
+}
+
+MapInterface() {
+  SOURCE_INTERFACES=($(ls /sys/class/net/))
+  for (( i = 0; i < ${#MAP_INTERFACES[@]}; i++ )); do
+    for (( j = 0; j < ${#SOURCE_INTERFACES[@]}; j++ )); do
+      if [[ ${MAP_INTERFACES[i]} == ${SOURCE_INTERFACES[j]} ]]; then
+        INTERFACE=$SOURCE_INTERFACES
+      fi
+    done
+  done
+}
+
+GetENV(){
+  if [ ! -z $ENV ]; then
+    if [ $ENV == 'prod' ]; then
+      LB=$PROD_LB
+      IPCLASS=$PROD_IPCLASS
+    elif [ $ENV == 'staging' ]; then
+      LB=$STG_LB
+      IPCLASS=$STG_IPCLASS
+    elif [ $ENV == 'dev' ]; then
+      LB=$DEV_LB
+      IPCLASS=$DEV_IPCLASS
+    else
+      echo "[fail] Can not get env type."
+      exit 1
+    fi
+  else
+    echo "[fail] Can not get the environment."
+    exit 1
+  fi
+}
+
+GetIP() {
+  MapInterface
+  for (( i = 0; i < ${#INTERFACE[@]}; i++ )); do
+    SERVICE_IP=$(ifconfig ${INTERFACE[i]} | grep 'inet addr:' | cut -d: -f2 | awk '{print $1}')
+    if [ ! -z $SERVICE_IP ]; then
+      break
+    fi
+  done
+}
+
+
+
+GetSession(){
+  SESSION=$(curl -s -k --connect-timeout $CURL_TIMEOUT "https://${LB}/services/rest/${VERSION}/?method=authenticate&format=${FORMAT}&username=${USERNAME}&password=${PASSWORD}" | awk -F'"' '{print $4}')
+  if [ -z $SESSION ]; then
+    echo [Error]: Did not get a A10 session.
+    exit 1
+  fi
+}
+
+CloseSession(){
+  # use session.close
+  Command "session.close"
+  if echo $RETURN_DATA | grep status &>/dev/null ; then
+    echo session is close.
+  fi
+}
+
+Command(){
+  CMD=$1
+  shift
+  POST=$@
+  if [ -z $SESSION ]; then
+    GetSession
+  fi
+  CMDURI="https://${LB}/services/rest/${VERSION}/?session_id=${SESSION}&format=${FORMAT}&method=${CMD}"
+  if [ -n $POST ]; then
+    RETURN_DATA=$(curl -s -k --connect-timeout $CURL_TIMEOUT $CMDURI -d "$POST")
+  else
+    RETURN_DATA=$(curl -s -k --connect-timeout $CURL_TIMEOUT $CMDURI)
+  fi
+}
+
+GetSLBServer(){
+  local IP
+  IP=$1
+  # use slb.server.search api
+  Command "slb.server.search" {\"host\":\"${IP}\"}
+  if echo $RETURN_DATA | grep "No such Server" &> /dev/null; then
+    echo "No such Server: ${IP}"
+    return 2
+  else
+    SLB_SERVER=$(echo $RETURN_DATA | grep -Po '"name":.*?[^\\]"' | awk -F'"' '{print $4}')
+  fi
+  unset RETURN_DATA
+}
+
+GetSLBServer_Status(){
+  # use slb.server.fetchStatistics without "port_stat_list"
+  Command "slb.server.fetchStatistics" {\"name\":\"${SLB_SERVER}\"}
+  SLB_SERVER_STATUS=$(echo $RETURN_DATA | awk -F'port_stat_list' '{print $1}' | grep -Po '"status":.*?[^\\]"' | grep -o '[0-9]\+')
+  unset RETURN_DATA
+}
+
+UpdateServerStatus(){
+  local STATUS
+  STATUS=$1
+  # use slb.server.update
+  Command "slb.server.update" \{\"name\":\"${SLB_SERVER}\",\"status\":\"$STATUS\"\}
+  if echo $RETURN_DATA | grep status &>/dev/null ; then
+    if [ $STATUS -eq 1 ]; then
+      echo "[200] ${SLB_SERVER} slb.server.update is enable"
+    elif [ $STATUS -eq 0 ]; then
+      echo "[200] ${SLB_SERVER} slb.server.update is disable"
+    fi
+  else
+    echo "[fail] ${SLB_SERVER} slb.server.update is failed."
+  fi
+}
+
+CheckConnectZero(){
+  # use slb.server.fetchStatistics
+  for (( i = 0; i < $CURR_RETRY; i++ )); do
+    Command "slb.server.fetchStatistics" {\"name\":\"${SLB_SERVER}\"}
+    CURCONNS=$(echo $RETURN_DATA | awk -F'port_stat_list' '{print $1}' | grep -Po '"cur_conns":.*?[^\\]"' | grep -o '[0-9]\+')
+    if [ "$CURCONNS" == 0 ]; then
+      echo "The current connection is clean"
+      break
+    else
+      echo "The current connection is $CURCONNS, retry $i times."
+      sleep $CURR_TIMEOUT
+      if [ $i == $(($CURR_RETRY -1)) ]; then
+        echo "$SLB_SERVER connect check fail, found $CURCONNS connect."
+        exit 1
+      fi
+    fi 
+  done
+  unset RETURN_DATA
+}
+
+CallWork(){
+  local IP
+  IP=$1
+  GetSLBServer $IP
+
+  if [ $? -eq 0 ]; then
+    GetSLBServer_Status
+
+    if [ $SLB_SERVER_STATUS == $UPDATE_STATUS ]; then
+      echo "The state already exists, skip update"
+    else
+      UpdateServerStatus $UPDATE_STATUS
+    fi
+    GetSLBServer_Status
+    echo "Current status: $SLB_SERVER is $SLB_SERVER_STATUS"
+  fi
+}
+
+Run(){
+  if [ -z $SERVICE_IP ]; then
+    GetIP
+  fi
+  for ipopt in ${SERVICE_IP[@]}; do
+    CallWork $ipopt
+  done
+}
+
+GetENV
+if [[ $# -gt 0 ]]; then
+  for opt in $@
+  do
+    case $opt in
+      overconn)
+        shift
+        if [ -z $SERVICE_IP ]; then
+          GetIP
+        fi
+        for ipopt in ${SERVICE_IP[@]}; do
+          GetSLBServer $ipopt
+          if [ $? -eq 0 ]; then
+            CheckConnectZero
+          fi
+        done
+        ;;
+      start)
+        shift
+        UPDATE_STATUS=1
+        Run
+        ;;
+      stop)
+        shift
+        UPDATE_STATUS=0
+        Run
+        ;;
+      restart)
+        shift
+        UPDATE_STATUS=0
+        Run
+        case "$SLB_SERVER_STATUS" in
+          0|1)
+            UPDATE_STATUS=1
+            SERVICE_IP=()
+            Run
+            ;;
+          *)
+            echo "SLB server status unknow. (without 0 or 1)"
+            ;;
+        esac
+        ;;
+      status)
+        shift
+        if [ -z $SERVICE_IP ]; then
+          GetIP
+        fi
+        for ipopt in ${SERVICE_IP[@]}; do
+          GetSLBServer $ipopt
+          if [ $? -eq 0 ]; then
+            GetSLBServer_Status
+            echo "Current status: $SLB_SERVER is $SLB_SERVER_STATUS"
+            if [ $SLB_SERVER_STATUS -eq 1 ]; then
+              echo "[200] ${SLB_SERVER} slb.server.fetchStatistics is enable"
+            elif [ $SLB_SERVER_STATUS -eq 0 ]; then
+              echo "[200] ${SLB_SERVER} slb.server.fetchStatistics is disable"
+            fi
+          fi
+        done
+        ;;
+      -v|-V|--version|-version|version)
+        showVersion
+        ;;
+      -h|--help|-help|*)
+        helpMsg
+        ;;
+    esac
+  done
+else
+  helpMsg
+fi
+
+if [ -n $SESSION ]; then
+  CloseSession
+fi
